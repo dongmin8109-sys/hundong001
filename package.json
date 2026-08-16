@@ -1,0 +1,12 @@
+{
+  "name": "hundong001",
+  "version": "1.0.0",
+  "description": "Render Web Service Project",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
