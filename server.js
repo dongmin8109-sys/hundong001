@@ -72,19 +72,16 @@ app.post('/api/orders', async (req, res) => {
   const id = code();
   const createdAt = now();
 
-  // Orders 테이블에 추가
   const { error: orderError } = await supabase
     .from('orders')
     .insert([{ id, product: productNames[type], type, details, status: '미수락', created_at: createdAt }]);
 
   if (orderError) return res.status(500).json({ error: orderError.message });
 
-  // Messages 테이블에 기본 안내 추가
   await supabase
     .from('messages')
     .insert([{ order_id: id, sender: 'admin', text: '문의가 정상적으로 접수되었습니다. 담당자가 확인 후 답변드릴게요.', created_at: createdAt }]);
 
-  // 생성된 데이터 조회 후 반환
   const { data: order } = await supabase.from('orders').select('*').eq('id', id).single();
   const { data: messages } = await supabase.from('messages').select('*').eq('order_id', id).order('id');
 
@@ -119,7 +116,7 @@ app.post('/api/orders/:id/messages', async (req, res) => {
     .insert([{ order_id: req.params.id, sender: 'customer', text, created_at: now() }]);
 
   const { data: order } = await supabase.from('orders').select('*').eq('id', req.params.id).single();
-  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', req.params.id).order('order_id');
+  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', req.params.id).order('id');
 
   res.status(201).json({
     ...order,
@@ -190,4 +187,4 @@ app.post('/api/admin/orders/:id/messages', requireAdmin, async (req, res) => {
 app.use(express.static(root));
 app.get('*', (req, res) => res.sendFile(path.join(root, 'index.html')));
 
-app.listen(port, () => console.log(`훈동여행사 서버: http://localhost:${port}`));
+app.listen(port, () => console.log(`서버 실행 중: http://localhost:${port}`));
