@@ -1,29 +1,19 @@
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
+const app = express();
+const port = process.env.PORT || 3000;
+const root = path.join(__dirname, 'public');
+
+// Supabase 연동
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
-  CREATE TABLE IF NOT EXISTS orders (
-    id TEXT PRIMARY KEY,
-    product TEXT NOT NULL,
-    type TEXT NOT NULL,
-    details TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT '미수락',
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT NOT NULL,
-    sender TEXT NOT NULL CHECK(sender IN ('admin','customer')),
-    text TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
-  );
-`);
+
+const sessions = new Map();
+const adminPassword = process.env.ADMIN_PASSWORD || '1234';
 
 app.use(express.json({ limit: '100kb' }));
 
@@ -33,6 +23,7 @@ const productNames = {
   restaurant: '주변 맛집',
   group: '가족 및 단체모임'
 };
+
 const requiredFields = {
   domestic: ['destination', 'period', 'preference', 'allergy', 'age', 'taste', 'feature', 'name'],
   international: ['destination', 'period', 'preference', 'allergy', 'age', 'taste', 'feature', 'name'],
@@ -40,31 +31,25 @@ const requiredFields = {
   group: ['location', 'range', 'menu', 'preference', 'allergy', 'name']
 };
 
-function now() { return new Date().toISOString(); }
-function publicOrder(row) {
-  if (!row) return null;
-  const { created_at, ...order } = row;
-  return { ...order, createdAt: new Date(created_at).toLocaleString('ko-KR'), details: JSON.parse(row.details), messages: getMessages(row.id) };
+function now() {
+  return new Date().toISOString();
 }
-function getMessages(orderId) {
-  return db.prepare('SELECT sender AS "from", text, created_at AS time FROM messages WHERE order_id = ? ORDER BY id').all(orderId)
-    .map(m => ({ ...m, time: new Date(m.time).toLocaleString('ko-KR') }));
+
+function cleanText(value, max = 1000) {
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
 }
-function orderRow(id) { return db.prepare('SELECT * FROM orders WHERE id = ?').get(id); }
+
+function code() {
+  return `HD-${crypto.randomInt(100000, 1000000)}`;
+}
+
 function requireAdmin(req, res, next) {
   const token = req.get('authorization')?.replace(/^Bearer\s+/i, '');
   if (!token || !sessions.has(token)) return res.status(401).json({ error: '관리자 로그인이 필요합니다.' });
   next();
 }
-function code() {
-  let id;
-  do { id = `HD-${crypto.randomInt(100000, 1000000)}`; } while (orderRow(id));
-  return id;
-}
-function cleanText(value, max = 1000) {
-  return typeof value === 'string' ? value.trim().slice(0, max) : '';
-}
 
+// 1. 관리자 로그인
 app.post('/api/admin/login', (req, res) => {
   const password = cleanText(req.body?.password, 100);
   if (!password || password.length !== adminPassword.length || !crypto.timingSafeEqual(Buffer.from(password), Buffer.from(adminPassword))) {
@@ -75,62 +60,134 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token });
 });
 
-app.post('/api/orders', (req, res) => {
+// 2. 문의/주문 생성
+app.post('/api/orders', async (req, res) => {
   const type = cleanText(req.body?.type, 30);
   const fields = requiredFields[type];
   if (!fields) return res.status(400).json({ error: '올바르지 않은 상담 상품입니다.' });
+
   const details = Object.fromEntries(fields.map(key => [key, cleanText(req.body?.details?.[key])]));
   if (fields.some(key => !details[key])) return res.status(400).json({ error: '필수 항목을 모두 입력해 주세요.' });
+
   const id = code();
   const createdAt = now();
-  db.prepare('INSERT INTO orders (id, product, type, details, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(id, productNames[type], type, JSON.stringify(details), '미수락', createdAt);
-  db.prepare('INSERT INTO messages (order_id, sender, text, created_at) VALUES (?, ?, ?, ?)')
-    .run(id, 'admin', '문의가 정상적으로 접수되었습니다. 담당자가 확인 후 답변드릴게요.', createdAt);
-  res.status(201).json(publicOrder(orderRow(id)));
+
+  // Orders 테이블에 추가
+  const { error: orderError } = await supabase
+    .from('orders')
+    .insert([{ id, product: productNames[type], type, details, status: '미수락', created_at: createdAt }]);
+
+  if (orderError) return res.status(500).json({ error: orderError.message });
+
+  // Messages 테이블에 기본 안내 추가
+  await supabase
+    .from('messages')
+    .insert([{ order_id: id, sender: 'admin', text: '문의가 정상적으로 접수되었습니다. 담당자가 확인 후 답변드릴게요.', created_at: createdAt }]);
+
+  // 생성된 데이터 조회 후 반환
+  const { data: order } = await supabase.from('orders').select('*').eq('id', id).single();
+  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', id).order('id');
+
+  res.status(201).json({
+    ...order,
+    createdAt: new Date(order.created_at).toLocaleString('ko-KR'),
+    messages: (messages || []).map(m => ({ ...m, from: m.sender, time: new Date(m.created_at).toLocaleString('ko-KR') }))
+  });
 });
 
-app.get('/api/orders/:id', (req, res) => {
-  const order = publicOrder(orderRow(req.params.id));
+// 3. 접수번호로 문의 조회
+app.get('/api/orders/:id', async (req, res) => {
+  const { data: order } = await supabase.from('orders').select('*').eq('id', req.params.id).single();
   if (!order) return res.status(404).json({ error: '일치하는 접수번호를 찾지 못했어요.' });
-  res.json(order);
+
+  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', req.params.id).order('id');
+
+  res.json({
+    ...order,
+    createdAt: new Date(order.created_at).toLocaleString('ko-KR'),
+    messages: (messages || []).map(m => ({ ...m, from: m.sender, time: new Date(m.created_at).toLocaleString('ko-KR') }))
+  });
 });
 
-app.post('/api/orders/:id/messages', (req, res) => {
-  const order = orderRow(req.params.id);
-  if (!order) return res.status(404).json({ error: '주문을 찾을 수 없습니다.' });
+// 4. 고객 메시지 전송
+app.post('/api/orders/:id/messages', async (req, res) => {
   const text = cleanText(req.body?.text, 1000);
   if (!text) return res.status(400).json({ error: '메시지를 입력해 주세요.' });
-  db.prepare('INSERT INTO messages (order_id, sender, text, created_at) VALUES (?, ?, ?, ?)').run(order.id, 'customer', text, now());
-  res.status(201).json(publicOrder(orderRow(order.id)));
+
+  await supabase
+    .from('messages')
+    .insert([{ order_id: req.params.id, sender: 'customer', text, created_at: now() }]);
+
+  const { data: order } = await supabase.from('orders').select('*').eq('id', req.params.id).single();
+  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', req.params.id).order('order_id');
+
+  res.status(201).json({
+    ...order,
+    createdAt: new Date(order.created_at).toLocaleString('ko-KR'),
+    messages: (messages || []).map(m => ({ ...m, from: m.sender, time: new Date(m.created_at).toLocaleString('ko-KR') }))
+  });
 });
 
-app.get('/api/admin/orders', requireAdmin, (req, res) => {
+// 5. 관리자 - 전체 문의 목록 조회
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   const status = cleanText(req.query.status, 10);
-  const rows = status && status !== '전체'
-    ? db.prepare('SELECT * FROM orders WHERE status = ? ORDER BY created_at DESC').all(status)
-    : db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
-  res.json(rows.map(publicOrder));
+  let query = supabase.from('orders').select('*').order('created_at', { ascending: false });
+
+  if (status && status !== '전체') {
+    query = query.eq('status', status);
+  }
+
+  const { data: orders } = await query;
+
+  const result = await Promise.all((orders || []).map(async (order) => {
+    const { data: messages } = await supabase.from('messages').select('*').eq('order_id', order.id);
+    return {
+      ...order,
+      createdAt: new Date(order.created_at).toLocaleString('ko-KR'),
+      messages: (messages || []).map(m => ({ ...m, from: m.sender, time: new Date(m.created_at).toLocaleString('ko-KR') }))
+    };
+  }));
+
+  res.json(result);
 });
 
-app.patch('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
+// 6. 관리자 - 문의 상태 변경
+app.patch('/api/admin/orders/:id/status', requireAdmin, async (req, res) => {
   const status = cleanText(req.body?.status, 10);
   if (!['미수락', '수락', '보류'].includes(status)) return res.status(400).json({ error: '올바른 상태가 아닙니다.' });
-  const result = db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, req.params.id);
-  if (!result.changes) return res.status(404).json({ error: '주문을 찾을 수 없습니다.' });
-  res.json(publicOrder(orderRow(req.params.id)));
+
+  await supabase.from('orders').update({ status }).eq('id', req.params.id);
+
+  const { data: order } = await supabase.from('orders').select('*').eq('id', req.params.id).single();
+  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', req.params.id);
+
+  res.json({
+    ...order,
+    createdAt: new Date(order.created_at).toLocaleString('ko-KR'),
+    messages: (messages || []).map(m => ({ ...m, from: m.sender, time: new Date(m.created_at).toLocaleString('ko-KR') }))
+  });
 });
 
-app.post('/api/admin/orders/:id/messages', requireAdmin, (req, res) => {
-  const order = orderRow(req.params.id);
-  if (!order) return res.status(404).json({ error: '주문을 찾을 수 없습니다.' });
+// 7. 관리자 - 답변 작성
+app.post('/api/admin/orders/:id/messages', requireAdmin, async (req, res) => {
   const text = cleanText(req.body?.text, 1000);
   if (!text) return res.status(400).json({ error: '메시지를 입력해 주세요.' });
-  db.prepare('INSERT INTO messages (order_id, sender, text, created_at) VALUES (?, ?, ?, ?)').run(order.id, 'admin', text, now());
-  res.status(201).json(publicOrder(orderRow(order.id)));
+
+  await supabase
+    .from('messages')
+    .insert([{ order_id: req.params.id, sender: 'admin', text, created_at: now() }]);
+
+  const { data: order } = await supabase.from('orders').select('*').eq('id', req.params.id).single();
+  const { data: messages } = await supabase.from('messages').select('*').eq('order_id', req.params.id);
+
+  res.status(201).json({
+    ...order,
+    createdAt: new Date(order.created_at).toLocaleString('ko-KR'),
+    messages: (messages || []).map(m => ({ ...m, from: m.sender, time: new Date(m.created_at).toLocaleString('ko-KR') }))
+  });
 });
 
 app.use(express.static(root));
-app.get('*splat', (req, res) => res.sendFile(path.join(root, 'index.html')));
+app.get('*', (req, res) => res.sendFile(path.join(root, 'index.html')));
 
 app.listen(port, () => console.log(`훈동여행사 서버: http://localhost:${port}`));
