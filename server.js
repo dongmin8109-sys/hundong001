@@ -2,20 +2,11 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { createClient } = require('@supabase/supabase-js');
 
-const app = express();
-const port = Number(process.env.PORT || 3000);
-const adminPassword = process.env.ADMIN_PASSWORD || '0604';
-const root = __dirname;
-const dataDir = path.join(root, 'data');
-fs.mkdirSync(dataDir, { recursive: true });
-const db = new DatabaseSync(path.join(dataDir, 'hoondong.sqlite'));
-const sessions = new Map();
-
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
   CREATE TABLE IF NOT EXISTS orders (
     id TEXT PRIMARY KEY,
     product TEXT NOT NULL,
