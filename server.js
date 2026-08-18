@@ -5,7 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const port = process.env.PORT || 3000;
-const root = path.join(__dirname, 'public');
+const root = __dirname;
 
 // Supabase 연동
 const supabaseUrl = process.env.SUPABASE_URL;
